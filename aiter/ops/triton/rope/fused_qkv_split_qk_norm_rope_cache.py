@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
@@ -25,16 +27,80 @@ def fused_qkv_split_qk_norm_rope_cache(
     k_scale: torch.Tensor = None,
     v_scale: torch.Tensor = None,
     eps: float = 1e-5,
+    rotary_dim_half: int | None = None,
+    gated_qkv_layout: str = "interleaved",
 ):
+    """Split packed ``qkv``, RMSNorm Q and K, apply RoPE, write K/V into paged caches.
+
+    Shapes follow ``qh`` / ``kvh`` / ``head_dim``. For RoPE, ``rotary_dim_half`` refers
+    to the half-width of the rotated subspace. The required ``cos`` / ``sin`` last-dim
+    shape depends on ``reuse_freqs_front_part``: when True, ``cos.shape[-1]`` and
+    ``sin.shape[-1]`` are the half-width (that is, ``rotary_dim_half``); when False,
+    they are the full rotary width (that is, ``2 * rotary_dim_half``). The
+    ``reuse_freqs_front_part`` flag must match how ``cos``/``sin`` were built for
+    partial rotation. When ``attn_output_gate`` is True, ``gated_qkv_layout`` is
+    ``"interleaved"`` (Q then gate per head in the flat Q+gate region) or ``"blocked"``
+    (all Q then all gate). Paged layout is inferred from ``key_cache`` /
+    ``value_cache`` (block size is ``shape[2]``); ``slot_mapping`` maps each token row
+    to a physical slot index.
+
+    Args:
+        qkv: ``[T, packed_dim]`` flat tensor (Q [+ gate], K, V).
+        q_weight, k_weight: RMSNorm gamma ``(head_dim,)``.
+        cos, sin: RoPE tables. If ``reuse_freqs_front_part`` is True, the last dim is
+            the rotary half-width; if False, the last dim is the full rotary width.
+        positions: Token positions into the RoPE table.
+        key_cache, value_cache: ``[num_blocks, heads, block_size, head_dim]``.
+        slot_mapping: ``[T]`` int32 (or index dtype), slot per token for cache write.
+        qh: Total query heads; ``kvh`` key/value heads; ``head_dim`` per-head size.
+        is_neox: NeoX vs GPT-J rotation style.
+        offsets: Optional position offsets (same semantics as other rope ops).
+        reuse_freqs_front_part: Frequency-table layout selector for partial RoPE.
+            True means front-part reuse tables with ``cos/sin.shape[-1] ==
+            rotary_dim_half``; False means non-reuse tables with
+            ``cos/sin.shape[-1] == 2 * rotary_dim_half``.
+        attn_output_gate: Whether Q+gate is packed in ``qkv``; returns ``(q, gate, k, v)``.
+        k_scale, v_scale: Optional per-call scalars applied before cache write.
+        eps: RMSNorm epsilon.
+        rotary_dim_half: Optional half-width of the rotated subspace. When set, it
+            corresponds to ``cos.shape[-1]`` only in reuse mode; in non-reuse mode the
+            table last dim is the full rotary width, ``2 * rotary_dim_half``.
+        gated_qkv_layout: ``"interleaved"`` or ``"blocked"`` when ``attn_output_gate``.
+    """
     T = qkv.shape[0]
     q_size = qh * head_dim
     kv_size = kvh * head_dim
 
-    # Get Paged Attention block size from cache shape (usually 16 or 32)
-    # Cache shape: [num_blocks, num_heads, block_size, head_dim]
-    block_size = key_cache.shape[2]
+    # Detect KV cache layout by matching kvh to the correct dimension.
+    # HND: [num_blocks, num_kv_heads, block_size, head_dim]
+    # NHD: [num_blocks, block_size, num_kv_heads, head_dim]
+    if key_cache.shape[1] == kvh:
+        block_size = key_cache.shape[2]
+        kc_stride_t = key_cache.stride(0)
+        kc_stride_h = key_cache.stride(1)
+        kc_stride_b = key_cache.stride(2)
+        kc_stride_d = key_cache.stride(3)
+        vc_stride_t = value_cache.stride(0)
+        vc_stride_h = value_cache.stride(1)
+        vc_stride_b = value_cache.stride(2)
+        vc_stride_d = value_cache.stride(3)
+    elif key_cache.shape[2] == kvh:
+        block_size = key_cache.shape[1]
+        kc_stride_t = key_cache.stride(0)
+        kc_stride_h = key_cache.stride(2)
+        kc_stride_b = key_cache.stride(1)
+        kc_stride_d = key_cache.stride(3)
+        vc_stride_t = value_cache.stride(0)
+        vc_stride_h = value_cache.stride(2)
+        vc_stride_b = value_cache.stride(1)
+        vc_stride_d = value_cache.stride(3)
+    else:
+        raise ValueError(
+            f"Cannot determine KV cache layout: key_cache.shape="
+            f"{key_cache.shape}, kvh={kvh}"
+        )
 
-    assert qh >= kvh and qh % kvh == 0, "qh must be mutiple of kvh"
+    assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
     q = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
     k = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
     v = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
@@ -46,14 +112,28 @@ def fused_qkv_split_qk_norm_rope_cache(
 
     if attn_output_gate:
         assert qkv.shape[-1] == 2 * q_size + 2 * kv_size, "Shape error"
+        assert gated_qkv_layout in (
+            "interleaved",
+            "blocked",
+        ), 'gated_qkv_layout must be "interleaved" or "blocked"'
     else:
         assert qkv.shape[-1] == q_size + 2 * kv_size, "Shape error"
+        assert gated_qkv_layout == "interleaved", (
+            "non-gated QKV only supports interleaved layout"
+        )
     assert head_dim == triton.next_power_of_2(head_dim), "head_dim should be power of 2"
+
+    assert cos.shape[-1] == sin.shape[-1], "cos and sin must match in last dim"
+    inferred_rd_half = cos.shape[-1]
+    if rotary_dim_half is not None:
+        assert rotary_dim_half == inferred_rd_half, (
+            f"rotary_dim_half={rotary_dim_half} but cos.shape[-1]={inferred_rd_half}"
+        )
+    ROTARY_DIM_HALF = inferred_rd_half
 
     # Logic for dimension splitting
     BLOCK_D = head_dim
     BLOCK_D_HALF = head_dim // 2
-    ROTARY_DIM_HALF = cos.shape[-1]
 
     BLOCK_T = 32
     num_warps = 4
@@ -89,14 +169,14 @@ def fused_qkv_split_qk_norm_rope_cache(
         stride_kv_t=k.stride(0),
         stride_kv_h=k.stride(1),
         stride_kv_d=k.stride(2),
-        key_cache_stride_t=key_cache.stride(0),
-        key_cache_stride_h=key_cache.stride(1),
-        key_cache_stride_d=key_cache.stride(3),  # head_dim stride
-        key_cache_stride_b=key_cache.stride(2),  # block_size stride
-        value_cache_stride_t=value_cache.stride(0),
-        value_cache_stride_h=value_cache.stride(1),
-        value_cache_stride_d=value_cache.stride(3),
-        value_cache_stride_b=value_cache.stride(2),
+        key_cache_stride_t=kc_stride_t,
+        key_cache_stride_h=kc_stride_h,
+        key_cache_stride_d=kc_stride_d,
+        key_cache_stride_b=kc_stride_b,
+        value_cache_stride_t=vc_stride_t,
+        value_cache_stride_h=vc_stride_h,
+        value_cache_stride_d=vc_stride_d,
+        value_cache_stride_b=vc_stride_b,
         REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
         IS_NEOX=is_neox,
         HAVE_POS=(positions is not None),
